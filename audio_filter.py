@@ -1,169 +1,129 @@
+import os
+import subprocess
 import numpy as np
 import soundfile as sf
-import subprocess
-import os
 from scipy.signal import butter, filtfilt
+try:
+    from openvino_noise_suppression import OpenVINONoiseSuppressor
+    AI_SUPPRESSOR = OpenVINONoiseSuppressor()
+except ImportError as e:
+    AI_SUPPRESSOR = None
+    print(f"Warning: {e}. AI noise suppression will be unavailable.")
 
-def apply_voice_enhancement(input_path, output_path, alpha=0.97):
+# Default parameters
+DEFAULT_ALPHA = 0.97
+DEFAULT_ORDER = 4
+
+def apply_audio_filter(filter_name, input_path, output_path,
+                       alpha=DEFAULT_ALPHA, order=DEFAULT_ORDER):
     """
-    Apply complete voice enhancement filter consisting of:
-    1. Pre-emphasis filter: y[n] = x[n] - α * x[n-1]
-    2. Band-pass filter (Butterworth) 800-6000 Hz
+    Dispatches to the requested audio filter.
+    Supported filters: 'voice_enhancement', 'ai_noise_suppression'
     """
+    if filter_name == 'voice_enhancement':
+        return _apply_voice_enhancement(input_path, output_path, alpha, order)
+    if filter_name == 'ai_noise_suppression':
+        return _apply_ai_noise_suppression(input_path, output_path)
+    return False, f'Unsupported filter: {filter_name}'
+
+def _apply_voice_enhancement(input_path, output_path, alpha, order):
+    """
+    1) Extracts WAV from video
+    2) Applies pre-emphasis + Butterworth band-pass (800–6000 Hz)
+    3) Remuxes processed audio into video
+    """
+    wd = os.path.dirname(output_path) or '.'
+    wav1 = os.path.join(wd, 'extracted.wav')
+    wav2 = os.path.join(wd, 'processed.wav')
     try:
-        # Convert to absolute paths
-        input_path = os.path.abspath(input_path)
-        output_path = os.path.abspath(output_path)
-        
-        print(f"Audio filter input: {input_path}")
-        print(f"Audio filter output: {output_path}")
-        
-        # Check if input file exists
-        if not os.path.exists(input_path):
-            return False, f"Input file not found: {input_path}"
-        
-        # STEP 1: Extract audio from MP4 using FFmpeg
-        output_dir = os.path.dirname(output_path)
-        extracted_audio_path = os.path.join(output_dir, 'extracted_audio.wav')
-        
-        print("Extracting audio from MP4...")
-        extract_cmd = [
-            'ffmpeg', '-y', '-i', input_path,
-            '-vn',  # No video
-            '-acodec', 'pcm_s16le',  # PCM format for soundfile
-            '-ar', '44100',  # Sample rate
-            '-ac', '2',      # Stereo
-            extracted_audio_path
-        ]
-        
-        subprocess.run(extract_cmd, check=True, capture_output=True, text=True)
-        print(f"Audio extracted to: {extracted_audio_path}")
-        
-        # STEP 2: Read the extracted audio with soundfile
-        audio_data, sample_rate = sf.read(extracted_audio_path)
-        print(f"Audio loaded: shape={audio_data.shape}, sample_rate={sample_rate}")
-        
-        # STEP 3: Apply complete voice enhancement filter
-        if len(audio_data.shape) > 1:
-            processed_audio = np.zeros_like(audio_data)
-            for channel in range(audio_data.shape[1]):
-                # Apply pre-emphasis + band-pass to each channel
-                processed_audio[:, channel] = complete_voice_enhancement_filter(
-                    audio_data[:, channel], sample_rate, alpha
-                )
+        # Extract raw PCM WAV
+        subprocess.run([
+            'ffmpeg','-y','-i', input_path,
+            '-vn','-acodec','pcm_s16le','-ar','44100','-ac','2', wav1
+        ], check=True, capture_output=True)
+
+        audio, sr = sf.read(wav1)
+        # Apply filter per channel
+        if audio.ndim > 1:
+            out = np.zeros_like(audio)
+            for ch in range(audio.shape[1]):
+                out[:,ch] = _voice_filter(audio[:,ch], sr, alpha, order)
         else:
-            # Mono audio
-            processed_audio = complete_voice_enhancement_filter(audio_data, sample_rate, alpha)
-        
-        # STEP 4: Save processed audio
-        processed_audio_path = os.path.join(output_dir, 'processed_audio.wav')
-        sf.write(processed_audio_path, processed_audio, sample_rate)
-        print(f"Processed audio saved: {processed_audio_path}")
-        
-        # STEP 5: Combine processed audio with original video
-        cmd = [
-            'ffmpeg', '-y', 
-            '-i', input_path,           # Original video
-            '-i', processed_audio_path, # Processed audio
-            '-c:v', 'copy',             # Copy video without re-encoding
-            '-c:a', 'aac',              # Encode audio as AAC
-            '-map', '0:v:0',            # Use video from first input
-            '-map', '1:a:0',            # Use audio from second input
+            out = _voice_filter(audio, sr, alpha, order)
+
+        sf.write(wav2, out, sr)
+
+        # Remux cleaned audio into video
+        subprocess.run([
+            'ffmpeg','-y','-i', input_path, '-i', wav2,
+            '-c:v','copy','-c:a','aac','-map','0:v','-map','1:a',
             output_path
-        ]
-        
-        print(f"Combining video and processed audio...")
-        result = subprocess.run(cmd, check=True, capture_output=True, text=True)
-        print("FFmpeg completed successfully")
-        
-        # STEP 6: Clean up temporary files
-        for temp_file in [extracted_audio_path, processed_audio_path]:
-            if os.path.exists(temp_file):
-                os.remove(temp_file)
-                print(f"Cleaned up: {temp_file}")
-        
-        # Check if output file was created
-        if os.path.exists(output_path):
-            print(f"Output file created successfully: {output_path}")
-            return True, "Voice enhancement filter applied successfully"
-        else:
-            return False, "Output file was not created"
-        
-    except subprocess.CalledProcessError as e:
-        print(f"FFmpeg error: {e.stderr}")
-        cleanup_temp_files(output_dir)
-        return False, f"FFmpeg failed: {e.stderr}"
-        
+        ], check=True, capture_output=True)
+
+        return True, 'Voice enhancement applied successfully'
+
     except Exception as e:
-        print(f"Voice enhancement filter error: {str(e)}")
-        cleanup_temp_files(output_dir)
-        return False, f"Voice enhancement filter failed: {str(e)}"
+        return False, str(e)
 
-def complete_voice_enhancement_filter(signal, sample_rate, alpha=0.97):
-    """
-    Apply complete voice enhancement as specified in PDF:
-    1. Pre-emphasis filter: y[n] = x[n] - α * x[n-1]
-    2. Band-pass filter (Butterworth) 800-6000 Hz
-    """
-    print("Applying pre-emphasis filter...")
-    
-    # STEP 1: Pre-emphasis filter
-    emphasized = preemphasis_filter(signal, alpha)
-    
-    print("Applying band-pass filter (800-6000 Hz)...")
-    
-    # STEP 2: Band-pass filter (Butterworth) 800-6000 Hz
-    # Design Butterworth band-pass filter
-    nyquist = sample_rate / 2
-    low_freq = 800 / nyquist    # Normalize to Nyquist frequency
-    high_freq = 6000 / nyquist  # Normalize to Nyquist frequency
-    
-    # Ensure frequencies are within valid range [0, 1]
-    low_freq = max(0.001, min(low_freq, 0.999))
-    high_freq = max(0.001, min(high_freq, 0.999))
-    
-    if low_freq >= high_freq:
-        high_freq = 0.999
-    
-    # Design 4th order Butterworth band-pass filter
-    b, a = butter(4, [low_freq, high_freq], btype='band')
-    
-    # Apply zero-phase filtering
-    filtered_signal = filtfilt(b, a, emphasized)
-    
-    print(f"Voice enhancement complete: Pre-emphasis + Band-pass (800-6000 Hz)")
-    
-    return filtered_signal
+    finally:
+        for f in (wav1, wav2):
+            if os.path.exists(f):
+                os.remove(f)
 
-def preemphasis_filter(signal, alpha=0.97):
-    """
-    Implement the pre-emphasis formula: y[n] = x[n] - α * x[n-1]
-    """
-    # Create output array
-    emphasized = np.zeros_like(signal)
-    
-    # First sample remains unchanged
-    emphasized[0] = signal[0]
-    
-    # Apply pre-emphasis formula for remaining samples
-    for n in range(1, len(signal)):
-        emphasized[n] = signal[n] - alpha * signal[n-1]
-    
-    return emphasized
+def _voice_filter(x, sr, alpha, order):
+    """Pre-emphasis followed by 4th-order Butterworth band-pass."""
+    # Pre-emphasis
+    y = np.empty_like(x)
+    y[0] = x[0]
+    for i in range(1, len(x)):
+        y[i] = x[i] - alpha * x[i-1]
 
-def cleanup_temp_files(output_dir):
-    """Clean up temporary audio files"""
-    temp_files = ['extracted_audio.wav', 'processed_audio.wav']
-    for temp_file in temp_files:
-        temp_path = os.path.join(output_dir, temp_file)
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
-            print(f"Cleaned up: {temp_path}")
+    # Butterworth band-pass 800–6000 Hz
+    ny = sr / 2.0
+    low, high = max(1e-3, 800/ny), min(0.999, 6000/ny)
+    if low >= high:
+        high = low + 1e-3
+    b, a = butter(order, [low, high], btype='band')
 
-def apply_audio_filter(filter_name, input_path, output_path, **kwargs):
-    """Main function to apply audio filters"""
-    if filter_name == "voice_enhancement" or filter_name == "preemphasis":
-        alpha = kwargs.get('alpha', 0.97)
-        return apply_voice_enhancement(input_path, output_path, alpha)
-    else:
-        return False, f"Unknown audio filter: {filter_name}"
+    filtered = filtfilt(b, a, y)
+    return filtered
+def _apply_ai_noise_suppression(input_path, output_path):
+    """
+    Uses the Ambassador-exclusive OpenVINO DenseUNet model for noise suppression:
+    1) Extracts 16 kHz mono WAV
+    2) Runs AI suppressor
+    3) Remuxes cleaned audio into video
+    """
+    if AI_SUPPRESSOR is None:
+        return False, "OpenVINONoiseSuppressor is not available. Please install the required module."
+    wd = os.path.dirname(output_path) or '.'
+    wav_in  = os.path.join(wd, 'ai_extracted.wav')
+    wav_out = os.path.join(wd, 'ai_processed.wav')
+    try:
+        # Extract mono 16 kHz WAV
+        subprocess.run([
+            'ffmpeg','-y','-i', input_path,
+            '-vn','-acodec','pcm_s16le','-ar','16000','-ac','1', wav_in
+        ], check=True, capture_output=True)
+
+        # Run OpenVINO noise suppressor
+        AI_SUPPRESSOR.suppress_file(wav_in, wav_out)
+
+        # Remux cleaned audio
+        subprocess.run([
+            'ffmpeg','-y','-i', input_path, '-i', wav_out,
+            '-c:v','copy','-c:a','aac','-map','0:v','-map','1:a',
+            output_path
+        ], check=True, capture_output=True)
+
+        return True, 'AI noise suppression applied successfully'
+
+    except Exception as e:
+        return False, str(e)
+
+    finally:
+        for f in (wav_in, wav_out):
+            if os.path.exists(f):
+                os.remove(f)
+            if os.path.exists(f):
+                os.remove(f)
